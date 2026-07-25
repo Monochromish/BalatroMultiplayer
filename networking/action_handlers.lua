@@ -61,6 +61,49 @@ end
 local reconnectToken = nil
 local lastLobbyCode = nil
 
+-- link_down spans socket drop until we are back in the lobby, which is longer
+-- than MP.LOBBY.connected being false. ui/game/timer.lua gates on it.
+MP.NET = MP.NET or {}
+MP.NET.link_down = false
+MP.NET.outage_started_at = nil
+
+local function link_restored()
+	MP.NET.link_down = false
+	MP.NET.outage_started_at = nil
+end
+
+-- The relay only knows what last got through, so the opponent's view of us is
+-- stale after an outage. These are all absolute-state messages, safe to repeat.
+local function resync_after_rejoin()
+	if G.STAGE ~= G.STAGES.RUN then return end
+
+	if MP.GAME.location_type then
+		-- set_location early-returns on an unchanged location; clear it to force the send.
+		local location_type, location_blind = MP.GAME.location_type, MP.GAME.location_blind
+		MP.GAME.location = nil
+		MP.ACTIONS.set_location(location_type, location_blind)
+	end
+
+	if G.GAME and G.GAME.round_resets and G.GAME.round_resets.ante then
+		MP.ACTIONS.set_ante(G.GAME.round_resets.ante)
+	end
+
+	if MP.GAME.furthest_blind then MP.ACTIONS.set_furthest_blind(MP.GAME.furthest_blind) end
+
+	-- Replays the wire string play_hand sent. INSANE_INT.to_string is a display
+	-- formatter (inserts commas), and play_hand mutates local timer state.
+	if MP.GAME.last_sent_score then
+		Client.send({
+			action = "playHand",
+			score = MP.GAME.last_sent_score,
+			handsLeft = MP.GAME.last_sent_hands_left or 0,
+		})
+	end
+end
+
+-- Set between rejoinLobby and the reply; link_down stays true for that window.
+local rejoin_pending = false
+
 local function action_connected()
 	MP.LOBBY.connected = true
 	MP.UI.update_connection_status()
@@ -72,11 +115,16 @@ local function action_connected()
 
 	-- If we have reconnect info, attempt to rejoin the lobby
 	if reconnectToken and lastLobbyCode then
+		rejoin_pending = true
 		Client.send({
 			action = "rejoinLobby",
 			code = lastLobbyCode,
 			reconnectToken = reconnectToken,
 		})
+	else
+		-- Nothing to rejoin; without this link_down latches on and freezes the timer.
+		rejoin_pending = false
+		link_restored()
 	end
 end
 
@@ -88,6 +136,9 @@ local function action_joinedLobby(p)
 	-- Store reconnect info for potential future reconnection
 	if token then reconnectToken = token end
 	lastLobbyCode = code
+	MP.LOBBY.connected = true
+	rejoin_pending = false
+	link_restored()
 	MP.ACTIONS.sync_client()
 	MP.ACTIONS.lobby_info()
 	MP.UI.update_connection_status()
@@ -103,8 +154,12 @@ local function action_rejoinedLobby(p)
 	MP.self_reconnect_countdown = nil
 	MP.GAME.timer_started = false
 	MP.GAME.nemesis_timer_started = false
+	MP.LOBBY.connected = true
+	rejoin_pending = false
+	link_restored()
 	MP.ACTIONS.sync_client()
 	MP.ACTIONS.lobby_info()
+	resync_after_rejoin()
 	MP.UI.update_connection_status()
 	sendWarnMessage("Reconnected to lobby!", "MULTIPLAYER")
 	G.FUNCS.exit_overlay_menu()
@@ -115,37 +170,50 @@ end
 MP.enemy_disconnect_countdown = nil
 MP.self_reconnect_countdown = nil
 
--- Shared timeout handler for both countdowns
-local function handle_reconnect_timeout(message)
+-- Destructive: clearing MP.LOBBY.code trips the watcher in ui/lobby/lobby.lua,
+-- which calls go_to_menu() + reset_game_states() and discards the run. Only on
+-- explicit player action or an explicit server refusal, never on a timer.
+local function abandon_lobby(message)
 	G.FUNCS.exit_overlay_menu()
 	MP.LOBBY.connected = false
+	MP.enemy_disconnect_countdown = nil
+	MP.self_reconnect_countdown = nil
 	if MP.LOBBY.code then MP.LOBBY.code = nil end
 	reconnectToken = nil
 	lastLobbyCode = nil
+	rejoin_pending = false
+	link_restored()
 	MP.UI.update_connection_status()
 	if G.STAGE ~= G.STAGES.MAIN_MENU then
 		MP.reset_game_states()
 		G.FUNCS.go_to_menu()
 	end
-	MP.UI.UTILS.overlay_message(message)
+	if message then MP.UI.UTILS.overlay_message(message) end
 end
+
+MP.NET.abandon_lobby = abandon_lobby
 
 -- Hook into Game.update to tick countdown displays
 local _disconnect_gupdate = Game.update
 function Game:update(dt)
 	if MP.enemy_disconnect_countdown then
 		local remaining = math.max(0, math.ceil(MP.enemy_disconnect_countdown.end_time - love.timer.getTime()))
-		MP.enemy_disconnect_countdown.display = remaining .. "s remaining"
-		-- No client-side timeout needed: the server sends stopGame
-		-- when the grace period expires, which handles the cleanup
+		MP.enemy_disconnect_countdown.display = remaining > 0 and (remaining .. "s remaining") or "still waiting..."
+		-- Safety net for a lost stopGame: this overlay is no_back, so nothing else
+		-- would ever release it. Skipped while our own link is down, since stopGame
+		-- could not reach us anyway.
+		if remaining <= 0 and not MP.enemy_disconnect_countdown.gave_up and not MP.NET.link_down then
+			if love.timer.getTime() - MP.enemy_disconnect_countdown.end_time > 20 then
+				MP.enemy_disconnect_countdown.gave_up = true
+				abandon_lobby("Opponent did not reconnect.\nReturning to main menu.")
+			end
+		end
 	end
 	if MP.self_reconnect_countdown then
 		local remaining = math.max(0, math.ceil(MP.self_reconnect_countdown.end_time - love.timer.getTime()))
-		MP.self_reconnect_countdown.display = remaining .. "s remaining"
-		if remaining <= 0 then
-			MP.self_reconnect_countdown = nil
-			handle_reconnect_timeout("Reconnection failed.\nReturning to main menu.")
-		end
+		-- Reaching zero tears nothing down; the thread keeps retrying and the run
+		-- stays valid, so the choice to wait or leave stays with the player.
+		MP.self_reconnect_countdown.display = remaining > 0 and (remaining .. "s remaining") or "still trying..."
 	end
 	return _disconnect_gupdate(self, dt)
 end
@@ -231,6 +299,20 @@ local function action_error(p)
 	local message = p.message
 	sendWarnMessage(message, "MULTIPLAYER")
 
+	-- An error mid-rejoin means the lobby is gone or the token is stale. Unfreeze
+	-- and offer the only two real options.
+	if rejoin_pending then
+		rejoin_pending = false
+		link_restored()
+		MP.self_reconnect_countdown = nil
+		G.FUNCS.exit_overlay_menu()
+		MP.UI.UTILS.overlay_message_actions("Could not rejoin the match:\n" .. tostring(message), {
+			{ label = localize("b_reconnect"), button = "reconnect", colour = G.C.GREEN },
+			{ label = localize("b_leave_lobby"), button = "mp_abandon_lobby", colour = G.C.RED },
+		})
+		return
+	end
+
 	MP.UI.UTILS.overlay_message(message)
 end
 
@@ -240,36 +322,53 @@ local function action_keep_alive()
 	})
 end
 
+-- A status change, not a teardown: the thread is still retrying underneath.
+-- Deliberately keeps MP.LOBBY.code (clearing it discards the run) and the
+-- reconnect token (clearing it left the Reconnect button unable to rejoin).
 local function action_disconnected()
 	MP.LOBBY.connected = false
-	MP.self_reconnect_countdown = nil
-	if MP.LOBBY.code then MP.LOBBY.code = nil end
-	-- Clear reconnect state since all reconnection attempts failed
-	reconnectToken = nil
-	lastLobbyCode = nil
+	MP.NET.link_down = true
 	MP.UI.update_connection_status()
+	sendWarnMessage("Still disconnected; retrying in the background.", "MULTIPLAYER")
+
+	if MP.self_reconnect_countdown then
+		MP.self_reconnect_countdown = nil
+		G.FUNCS.exit_overlay_menu()
+		if MP.LOBBY.code then
+			MP.UI.UTILS.overlay_message_actions("Could not reconnect in time.\nThe match may no longer be running.", {
+				{ label = localize("b_reconnect"), button = "reconnect", colour = G.C.GREEN },
+				{ label = localize("b_leave_lobby"), button = "mp_abandon_lobby", colour = G.C.RED },
+			})
+		end
+	end
 end
 
 local function action_reconnecting()
-	-- Only show if we were in a lobby and don't already have a countdown running
-	if reconnectToken and lastLobbyCode and not MP.self_reconnect_countdown then
-		MP.LOBBY.connected = false
-		MP.GAME.timer_started = false
-		MP.GAME.nemesis_timer_started = false
-		MP.UI.update_connection_status()
-		sendWarnMessage("Connection lost, attempting to reconnect...", "MULTIPLAYER")
+	if MP.self_reconnect_countdown then return end
 
-		MP.self_reconnect_countdown = {
-			end_time = love.timer.getTime() + 60,
-			display = "60s remaining",
-		}
+	MP.LOBBY.connected = false
+	MP.NET.link_down = true
+	MP.NET.outage_started_at = love.timer.getTime()
+	MP.GAME.timer_started = false
+	MP.GAME.nemesis_timer_started = false
+	MP.UI.update_connection_status()
+	sendWarnMessage("Connection lost, attempting to reconnect...", "MULTIPLAYER")
 
-		MP.UI.UTILS.overlay_message_countdown(
-			"Connection lost,\nattempting to reconnect...",
-			MP.self_reconnect_countdown,
-			true
-		)
-	end
+	-- No lobby to reconnect to; the Play menu already offers Reconnect.
+	if not lastLobbyCode and not MP.LOBBY.code then return end
+
+	-- Matches RECONNECT_NOTIFY_AFTER in networking/socket.lua.
+	MP.self_reconnect_countdown = {
+		end_time = love.timer.getTime() + 120,
+		display = "120s remaining",
+	}
+
+	MP.UI.UTILS.overlay_message_countdown(
+		"Connection lost,\nattempting to reconnect...",
+		MP.self_reconnect_countdown,
+		true,
+		{ { label = localize("b_leave_lobby"), button = "mp_abandon_lobby", colour = G.C.RED } }
+	)
 end
 
 local function action_start_game(p)
@@ -460,6 +559,9 @@ end
 
 local function action_stop_game()
 	MP.enemy_disconnect_countdown = nil
+	MP.self_reconnect_countdown = nil
+	rejoin_pending = false
+	link_restored()
 	if G.STAGE ~= G.STAGES.MAIN_MENU then
 		G.FUNCS.go_to_menu()
 		MP.UI.update_connection_status()
@@ -1204,6 +1306,10 @@ function MP.ACTIONS.play_hand(score, hands_left)
 		MP.GAME.highest_score = insane_int_score
 	end
 
+	-- Kept for resync_after_rejoin.
+	MP.GAME.last_sent_score = fixed_score
+	MP.GAME.last_sent_hands_left = hands_left
+
 	Client.send({
 		action = "playHand",
 		score = fixed_score,
@@ -1552,7 +1658,15 @@ function Game:update(dt)
                 end
     
                 local handler = HANDLERS[parsedAction.action]
-                if handler then handler(parsedAction) end
+                if handler then
+                    local handler_ok, handler_err = pcall(handler, parsedAction)
+                    if not handler_ok then
+                        sendWarnMessage(
+                            string.format("Handler for '%s' failed: %s", tostring(parsedAction.action), tostring(handler_err)),
+                            "MULTIPLAYER"
+                        )
+                    end
+                end
             else
                 sendWarnMessage(
                     "Invalid server response: " .. msg,

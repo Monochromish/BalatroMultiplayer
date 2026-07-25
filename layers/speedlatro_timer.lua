@@ -62,7 +62,17 @@ function Game:update(dt)
 				and MP.is_pvp_boss()
 			)
 		then
-			if not (G.CONTROLLER.locks.enter_pvp or MP.GAME.ready_blind or MP.speedlatro_timer.wait) then
+			-- link_down matters here because the guard above is `not (... and
+			-- MP.LOBBY.connected and ...)`: losing the connection makes it false, so
+			-- we fall into this branch and keep draining the clock.
+			if
+				not (
+					G.CONTROLLER.locks.enter_pvp
+					or MP.GAME.ready_blind
+					or MP.speedlatro_timer.wait
+					or (MP.NET and MP.NET.link_down)
+				)
+			then
 				-- ok look
 				-- insaneint is only intended for ui purposes
 				-- so we don't actually have the score as much as we have a representation of it...

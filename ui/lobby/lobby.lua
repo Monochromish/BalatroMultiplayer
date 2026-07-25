@@ -635,6 +635,20 @@ function G.FUNCS.reconnect(e)
 	G.FUNCS.exit_overlay_menu()
 end
 
+-- Escape hatch from the disconnect overlays: a dropped connection no longer
+-- tears the run down on its own, so abandoning has to be explicit.
+function G.FUNCS.mp_abandon_lobby(e)
+	if MP.NET and MP.NET.abandon_lobby then
+		MP.ACTIONS.leave_lobby()
+		MP.NET.abandon_lobby()
+	else
+		G.FUNCS.exit_overlay_menu()
+	end
+	MP.MODIFIERS = {}
+	MP._version_mismatch_shown = false
+	G.STATE = G.STATES.MENU
+end
+
 function MP.update_player_usernames()
 	if MP.LOBBY.code then
 		if G.MAIN_MENU_UI then G.MAIN_MENU_UI:remove() end

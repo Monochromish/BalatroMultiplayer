@@ -407,6 +407,10 @@ function Game:update(dt)
 	-- Bail fast: not an MP PvP-timer context
 	if G.STATE == G.STATES.GAME_OVER or MP.GAME.won then return end
 	if not MP.LOBBY.code then return end
+	-- Clearing timer_started in action_reconnecting is not enough: pressure_timer
+	-- ticks regardless of those flags, and G.SETTINGS.paused does not stop this
+	-- function either.
+	if MP.NET and MP.NET.link_down then return end
 	if not MP.LOBBY.config.timer then return end
 	if MP.GAME.timer_consumed then return end
 	if MP.GAME.pvp_countdown_in_progress then return end

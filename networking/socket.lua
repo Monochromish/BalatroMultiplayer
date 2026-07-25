@@ -30,204 +30,284 @@ if DEBUGGING then
 end
 
 Networking = {}
-local isSocketClosed = true
-local hasGivenUp = false -- true after all reconnect attempts failed
 local networkToUiChannel = love.thread.getChannel("networkToUi")
 local uiToNetworkChannel = love.thread.getChannel("uiToNetwork")
 
--- Reconnection settings
-local maxReconnectAttempts = 3
-local reconnectDelays = { 2, 4, 8 } -- seconds, exponential backoff
+-- Worst case detection is KEEPALIVE_IDLE + KEEPALIVE_PROBES * KEEPALIVE_PROBE,
+-- plus CONNECT_TIMEOUT before the first reattempt lands: 24s. That has to stay
+-- comfortably under the server's lobby grace period (60s, per enemyDisconnected).
+local TICK = 0.05
+local CONNECT_TIMEOUT = 5
+local KEEPALIVE_IDLE = 10
+local KEEPALIVE_PROBE = 3
+local KEEPALIVE_PROBES = 3
+local RECONNECT_DELAYS = { 0, 1, 2, 3, 5, 8, 10 } -- last value repeats forever
+local RECONNECT_NOTIFY_AFTER = 120
+local RECV_BUFFER_MAX = 8 * 1024 * 1024
 
-function Networking.connect()
-	-- TODO: Check first if Networking.Client is not null
-	-- and if it is, skip this function
+local STATE_IDLE = "idle"
+local STATE_CONNECTED = "connected"
+local STATE_RETRYING = "retrying"
 
+local state = STATE_IDLE
+local retryIndex = 0
+local retryAt = 0
+local outageStartedAt = nil
+local notifiedGaveUp = false
+
+local sendQueue = {}
+local sendHead = 1
+local sendOffset = 0 -- bytes of sendQueue[sendHead] already written
+
+-- receive("*l") returns nil, "timeout", partial when a line straddles two reads,
+-- and the partial is already consumed from the socket. It has to be fed back as
+-- the prefix argument or the front of the message is gone.
+local recvBuffer = ""
+
+local lastRecvAt = 0
+local probesSent = 0
+local nextProbeAt = nil
+
+local function now()
+	return socket.gettime()
+end
+
+local function resetSendQueue()
+	sendQueue = {}
+	sendHead = 1
+	sendOffset = 0
+end
+
+local function enqueue(msg)
+	sendQueue[#sendQueue + 1] = msg .. "\n"
+end
+
+local function retryDelay(index)
+	local last = #RECONNECT_DELAYS
+	if index < 1 then index = 1 end
+	if index > last then index = last end
+	return RECONNECT_DELAYS[index]
+end
+
+function Networking.closeSocket()
+	if Networking.Client then
+		pcall(function()
+			Networking.Client:close()
+		end)
+	end
+	Networking.Client = nil
+	recvBuffer = ""
+	resetSendQueue()
+end
+
+-- Safe to call repeatedly; only the first call of an outage notifies the UI.
+local function markDisconnected()
+	local wasConnected = state == STATE_CONNECTED
+	Networking.closeSocket()
+	state = STATE_RETRYING
+	retryIndex = 0
+	retryAt = now()
+	probesSent = 0
+	nextProbeAt = nil
+
+	if not outageStartedAt then
+		outageStartedAt = now()
+		notifiedGaveUp = false
+	end
+
+	if wasConnected then
+		SEND_THREAD_DEBUG_MESSAGE("Connection lost, retrying...")
+		networkToUiChannel:push("{\"action\":\"reconnecting\"}")
+	end
+end
+
+-- announceFailure only for a user-initiated connect, so background retries do
+-- not spam an error overlay.
+function Networking.connect(announceFailure)
 	SEND_THREAD_DEBUG_MESSAGE(
 		string.format("Attempting to connect to multiplayer server... URL: %s, PORT: %d", CONFIG_URL, CONFIG_PORT)
 	)
 
-	Networking.Client = socket.tcp()
-	-- Allow for 10 seconds to reconnect
-	Networking.Client:settimeout(10)
+	Networking.closeSocket()
 
-	Networking.Client:setoption("tcp-nodelay", true)
-	local connectionResult, errorMessage = Networking.Client:connect(CONFIG_URL, CONFIG_PORT) -- Not sure if I want to make these values public yet
-
-	if connectionResult ~= 1 then
-		SEND_THREAD_DEBUG_MESSAGE(string.format("%s", errorMessage))
-		networkToUiChannel:push(json.encode({
-			action = "error",
-			message = "Failed to connect to multiplayer server",
-		}))
+	local client = socket.tcp()
+	if not client then
+		SEND_THREAD_DEBUG_MESSAGE("socket.tcp() returned nil")
 		return false
-	else
-		isSocketClosed = false
-		hasGivenUp = false
 	end
 
-	Networking.Client:settimeout(0)
+	client:settimeout(CONNECT_TIMEOUT)
+	local connectionResult, errorMessage = client:connect(CONFIG_URL, CONFIG_PORT)
+
+	if connectionResult ~= 1 then
+		SEND_THREAD_DEBUG_MESSAGE(string.format("%s", errorMessage or "connect failed"))
+		pcall(function()
+			client:close()
+		end)
+		if announceFailure then
+			networkToUiChannel:push(json.encode({
+				action = "error",
+				message = "Failed to connect to multiplayer server",
+			}))
+		end
+		return false
+	end
+
+	client:setoption("tcp-nodelay", true)
+	client:settimeout(0)
+
+	Networking.Client = client
+	state = STATE_CONNECTED
+	recvBuffer = ""
+	resetSendQueue()
+	lastRecvAt = now()
+	probesSent = 0
+	nextProbeAt = nil
+	outageStartedAt = nil
+	notifiedGaveUp = false
+	retryIndex = 0
+
+	SEND_THREAD_DEBUG_MESSAGE("Connected.")
 	return true
 end
 
--- Attempt automatic reconnection with exponential backoff.
--- Returns true if reconnected, false if all attempts failed.
-function Networking.tryReconnect()
-	SEND_THREAD_DEBUG_MESSAGE("Connection lost, attempting automatic reconnection...")
+-- Messages pushed while the link is down are discarded rather than queued: they
+-- would land ahead of the rejoinLobby handshake. resync_after_rejoin re-states
+-- what matters once we are back.
+local function pumpOutbound()
+	for _ = 1, 100 do
+		local msg = uiToNetworkChannel:pop()
+		if not msg then return end
 
-	for attempt = 1, maxReconnectAttempts do
-		local delay = reconnectDelays[attempt] or reconnectDelays[#reconnectDelays]
-		SEND_THREAD_DEBUG_MESSAGE(string.format("Reconnect attempt %d/%d in %ds...", attempt, maxReconnectAttempts, delay))
-		socket.sleep(delay)
+		if msg == "{\"action\":\"connect\"}" then
+			outageStartedAt = nil
+			notifiedGaveUp = false
+			if not Networking.connect(true) then
+				state = STATE_RETRYING
+				retryIndex = 0
+				retryAt = now() + retryDelay(1)
+				outageStartedAt = now()
+			end
+		elseif state == STATE_CONNECTED then
+			enqueue(msg)
+		end
+	end
+end
 
-		if Networking.connect() then
-			SEND_THREAD_DEBUG_MESSAGE("Reconnected successfully!")
-			return true
+local function flushOutbound()
+	if state ~= STATE_CONNECTED or not Networking.Client then return end
+
+	while sendHead <= #sendQueue do
+		local msg = sendQueue[sendHead]
+		local sent, err, lastSent = Networking.Client:send(msg, sendOffset + 1)
+
+		if sent then
+			sendQueue[sendHead] = nil
+			sendHead = sendHead + 1
+			sendOffset = 0
+		elseif err == "timeout" then
+			-- Buffer full; resume from this byte next tick.
+			if lastSent and lastSent > sendOffset then sendOffset = lastSent end
+			return
+		else
+			SEND_THREAD_DEBUG_MESSAGE(string.format("send failed: %s", tostring(err)))
+			markDisconnected()
+			return
 		end
 	end
 
-	SEND_THREAD_DEBUG_MESSAGE("All reconnection attempts failed.")
-	return false
+	resetSendQueue()
 end
 
--- Check for messages from the main thread
-local mainThreadMessageQueue = function()
-	-- Executes a max of requestsPerCycle action requests
-	-- from the main thread and then yields
-	local requestsPerCycle = 25
-	while true do
-		for _ = 1, requestsPerCycle do
-			local msg = uiToNetworkChannel:pop()
-			if msg then
-				if msg == "{\"action\":\"connect\"}" then
-					hasGivenUp = false
-					Networking.connect()
-				else
-					Networking.Client:send(msg .. "\n")
-				end
+local function handleLine(data)
+	lastRecvAt = now()
+	probesSent = 0
+	nextProbeAt = nil
+
+	-- Answered here rather than via the UI thread to save a frame. Queued, not
+	-- sent inline, so it cannot interleave with a partially-written message.
+	if string.find(data, '"keepAlive"', 1, true) and not string.find(data, "Ack", 1, true) then
+		enqueue('{"action":"keepAliveAck"}')
+	end
+
+	networkToUiChannel:push(data)
+end
+
+local function pumpInbound()
+	if state ~= STATE_CONNECTED or not Networking.Client then return end
+
+	for _ = 1, 100 do
+		local data, err, partial = Networking.Client:receive("*l", recvBuffer)
+
+		if data then
+			recvBuffer = ""
+			handleLine(data)
+		elseif err == "timeout" then
+			recvBuffer = partial or recvBuffer
+			if #recvBuffer > RECV_BUFFER_MAX then
+				SEND_THREAD_DEBUG_MESSAGE("Inbound buffer overflow, dropping connection")
+				markDisconnected()
+			end
+			return
+		else
+			SEND_THREAD_DEBUG_MESSAGE(string.format("receive failed: %s", tostring(err)))
+			markDisconnected()
+			return
+		end
+	end
+end
+
+local function pumpKeepAlive()
+	if state ~= STATE_CONNECTED then return end
+	local t = now()
+
+	if nextProbeAt then
+		if t >= nextProbeAt then
+			if probesSent >= KEEPALIVE_PROBES then
+				SEND_THREAD_DEBUG_MESSAGE("Keepalive unanswered, dropping connection")
+				markDisconnected()
 			else
-				-- If there are no more messages, yield
-				coroutine.yield()
+				enqueue('{"action":"keepAlive"}')
+				probesSent = probesSent + 1
+				nextProbeAt = t + KEEPALIVE_PROBE
 			end
 		end
-
-		coroutine.yield()
+	elseif t - lastRecvAt >= KEEPALIVE_IDLE then
+		enqueue('{"action":"keepAlive"}')
+		probesSent = 1
+		nextProbeAt = t + KEEPALIVE_PROBE
 	end
 end
-local mainThreadCoroutine = coroutine.create(mainThreadMessageQueue)
 
-local timer = function(time)
-	local init = os.time()
-	local diff = os.difftime(os.time(), init)
-	while diff < time do
-		coroutine.yield(diff)
-		diff = os.difftime(os.time(), init)
+local function pumpReconnect()
+	if state ~= STATE_RETRYING then return end
+	local t = now()
+
+	-- Tell the UI once, but keep retrying so the menu recovers on its own.
+	if not notifiedGaveUp and outageStartedAt and (t - outageStartedAt) >= RECONNECT_NOTIFY_AFTER then
+		notifiedGaveUp = true
+		networkToUiChannel:push("{\"action\":\"disconnected\"}")
+	end
+
+	if t < retryAt then return end
+
+	retryIndex = retryIndex + 1
+	SEND_THREAD_DEBUG_MESSAGE(string.format("Reconnect attempt %d...", retryIndex))
+
+	if not Networking.connect(false) then
+		retryAt = now() + retryDelay(retryIndex + 1)
 	end
 end
-local timerCoroutine = coroutine.create(timer)
 
--- All values are in seconds
-local keepAliveInitialTimeout = 20
-local keepAliveRetryTimeout = 5
-local keepAliveRetryCount = 4
-
-local isRetry = false
-local retryCount = 0
-
--- Check for network packets
-local networkPacketQueue = function()
-	local packetsPerCycle = 25
-	while true do
-		if Networking.Client and not hasGivenUp then
-			-- Tries to fetch a packet a max of packetsPerCycle times
-			-- and then yields
-			for _ = 1, packetsPerCycle do
-				local data, error, partial = Networking.Client:receive()
-				if data then
-					-- Packet arrived, reset retries
-					isRetry = false
-					retryCount = 0
-					-- Also reset timer
-					timerCoroutine = coroutine.create(timer)
-
-					-- Respond to server keepAlive directly on the socket
-					-- to avoid latency from routing through the UI thread
-					if string.find(data, '"keepAlive"') and not string.find(data, 'Ack') then
-						Networking.Client:send('{"action":"keepAliveAck"}\n')
-					end
-
-					-- Send the string as is to the main thread
-					networkToUiChannel:push(data)
-				elseif error == "close" then
-					-- Connection closed, attempt automatic reconnection
-					isSocketClosed = true
-					retryCount = 0
-					isRetry = false
-					timerCoroutine = coroutine.create(timer)
-
-					networkToUiChannel:push("{\"action\":\"reconnecting\"}")
-					if not Networking.tryReconnect() then
-						hasGivenUp = true
-						networkToUiChannel:push("{\"action\":\"disconnected\"}")
-					end
-					break
-				else
-					-- If there are no more packets, yield
-					coroutine.yield()
-				end
-			end
-
-			coroutine.yield()
-		end
-
-		coroutine.yield()
-	end
-end
-local networkCoroutine = coroutine.create(networkPacketQueue)
-
--- Checks for network packets,
--- then sends them to the main thread
--- then advances timers
--- and then sleeps
+-- Nothing here blocks for longer than one connect attempt, so a stalled link
+-- cannot freeze the thread the way the old sleep-based backoff did.
 while true do
-	coroutine.resume(mainThreadCoroutine)
-	coroutine.resume(networkCoroutine)
+	pumpOutbound()
+	flushOutbound()
+	pumpInbound()
+	pumpKeepAlive()
+	pumpReconnect()
 
-	-- Run Timer
-	if not isSocketClosed and coroutine.status(timerCoroutine) ~= "dead" then
-		coroutine.resume(timerCoroutine, keepAliveInitialTimeout)
-	elseif not isSocketClosed then
-		-- Timer triggered
-		isRetry = true
-
-		if retryCount > keepAliveRetryCount then
-			Networking.Client:close()
-
-			-- Keepalive failed, attempt automatic reconnection
-			isSocketClosed = true
-			retryCount = 0
-			isRetry = false
-			timerCoroutine = coroutine.create(timer)
-
-			networkToUiChannel:push("{\"action\":\"reconnecting\"}")
-			if not Networking.tryReconnect() then
-				hasGivenUp = true
-				networkToUiChannel:push("{\"action\":\"disconnected\"}")
-			end
-		end
-
-		if isRetry then
-			retryCount = retryCount + 1
-			-- Send keepAlive without cutting the line
-			uiToNetworkChannel:push("{\"action\":\"keepAlive\"}")
-
-			-- Restart the timer
-			timerCoroutine = coroutine.create(timer)
-			coroutine.resume(timerCoroutine, keepAliveRetryTimeout)
-		end
-	end
-
-	-- Sleeps for 50 milliseconds
-	socket.sleep(0.05)
+	socket.sleep(TICK)
 end
 ]]
