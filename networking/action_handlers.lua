@@ -101,6 +101,18 @@ local function resync_after_rejoin()
 	end
 end
 
+-- A reconnect on either side loses the server's per-round ready flag, while the
+-- local client still shows readied — so the blind never starts and the only way
+-- out is toggling unready/ready by hand. action_start_blind clears ready_blind,
+-- so this cannot re-fire once a blind is under way.
+local function reassert_ready_blind()
+	if G.STAGE ~= G.STAGES.RUN then return end
+	if not MP.GAME.ready_blind then return end
+	sendWarnMessage("Re-asserting ready state after reconnect", "MULTIPLAYER")
+	MP.ACTIONS.set_location("loc_ready")
+	Client.send({ action = "readyBlind" })
+end
+
 -- Set between rejoinLobby and the reply; link_down stays true for that window.
 local rejoin_pending = false
 
@@ -160,6 +172,7 @@ local function action_rejoinedLobby(p)
 	MP.ACTIONS.sync_client()
 	MP.ACTIONS.lobby_info()
 	resync_after_rejoin()
+	reassert_ready_blind()
 	MP.UI.update_connection_status()
 	sendWarnMessage("Reconnected to lobby!", "MULTIPLAYER")
 	G.FUNCS.exit_overlay_menu()
@@ -239,6 +252,7 @@ end
 
 local function action_enemyReconnected()
 	MP.enemy_disconnect_countdown = nil
+	reassert_ready_blind()
 	sendWarnMessage("Opponent reconnected!", "MULTIPLAYER")
 	G.FUNCS.exit_overlay_menu()
 	MP.UI.UTILS.overlay_message("Opponent reconnected!")

@@ -2,7 +2,11 @@
 -- reproduces LuaSocket's partial-IO semantics: receive("*l") consumes the partial
 -- it returns on timeout, and send() can accept only part of a payload.
 --
---   lua tests/test_socket_thread.lua
+-- Run with luajit, NOT lua: Balatro runs LuaJIT, and the two disagree on # for a
+-- table with nil holes. A queue-drain bug that loses messages on LuaJIT passes
+-- silently under Lua 5.4/5.5.
+--
+--   luajit tests/test_socket_thread.lua
 
 local failures = 0
 local checks = 0
@@ -277,6 +281,41 @@ do
 	local sent = h.current.sent
 	eq(sent, big .. "\n" .. second .. "\n", "both payloads written whole and in order")
 	check(not sent:find("}{", 1, true), "no interleaving between queued messages")
+end
+
+-- 3b. A burst queued in one tick must all go out, in order.
+-- G.FUNCS.mp_toggle_ready sends setLocation + readyBlind (and pause_ante_timer
+-- when unreadying) in a single frame, so they land in one tick together.
+print("\nmulti-message burst in a single tick")
+do
+	-- Exactly three: the unready path's setLocation + pauseAnteTimer +
+	-- unreadyBlind. On LuaJIT a three-element queue drained by punching nil holes
+	-- loses the last entry, which is the bug this guards.
+	local burst = {
+		'{"action":"setLocation","location":"loc_selecting-bl_mp_nemesis"}',
+		'{"action":"pauseAnteTimer","time":150}',
+		'{"action":"unreadyBlind"}',
+	}
+
+	local h = run_thread({
+		max_ticks = 40,
+		on_tick = function(harness)
+			local s = harness.current
+			if not s then
+				harness.to_net[#harness.to_net + 1] = CONNECT
+				return
+			end
+			if harness.ticks == 3 then
+				for _, m in ipairs(burst) do
+					harness.to_net[#harness.to_net + 1] = m
+				end
+			end
+		end,
+	})
+
+	local expected = table.concat(burst, "\n") .. "\n"
+	eq(h.current.sent, expected, "all three burst messages sent, in order")
+	check(h.current.sent:find("unreadyBlind", 1, true) ~= nil, "the last message in the burst survived")
 end
 
 -- 4. Keepalive probes, then declare the link dead

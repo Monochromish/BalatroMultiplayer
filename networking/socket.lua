@@ -55,8 +55,12 @@ local retryAt = 0
 local outageStartedAt = nil
 local notifiedGaveUp = false
 
+-- sendTail is tracked explicitly rather than using #sendQueue: draining punches
+-- a nil hole at sendHead, and # on a table with a hole is an unspecified border
+-- -- it returns 0 for a 3-element queue, which silently discarded the backlog.
 local sendQueue = {}
 local sendHead = 1
+local sendTail = 0
 local sendOffset = 0 -- bytes of sendQueue[sendHead] already written
 
 -- receive("*l") returns nil, "timeout", partial when a line straddles two reads,
@@ -75,11 +79,13 @@ end
 local function resetSendQueue()
 	sendQueue = {}
 	sendHead = 1
+	sendTail = 0
 	sendOffset = 0
 end
 
 local function enqueue(msg)
-	sendQueue[#sendQueue + 1] = msg .. "\n"
+	sendTail = sendTail + 1
+	sendQueue[sendTail] = msg .. "\n"
 end
 
 local function retryDelay(index)
@@ -197,7 +203,7 @@ end
 local function flushOutbound()
 	if state ~= STATE_CONNECTED or not Networking.Client then return end
 
-	while sendHead <= #sendQueue do
+	while sendHead <= sendTail do
 		local msg = sendQueue[sendHead]
 		local sent, err, lastSent = Networking.Client:send(msg, sendOffset + 1)
 
