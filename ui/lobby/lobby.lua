@@ -185,16 +185,13 @@ function G.UIDEF.create_UIBox_custom_seed_overlay()
 	})
 end
 
-function G.UIDEF.create_UIBox_view_hash(type)
+function G.UIDEF.create_UIBox_view_hash(player)
 	return (
 		create_UIBox_generic_options({
 			contents = {
 				MP.UI.UTILS.create_column(
 					{ padding = 0.07, align = "cm" },
-					MP.UI.modlist_to_view(
-						type == "host" and MP.LOBBY.host.config.Mods or MP.LOBBY.guest.config.Mods,
-						G.C.UI.TEXT_LIGHT
-					)
+					MP.UI.modlist_to_view(player.config and player.config.Mods, G.C.UI.TEXT_LIGHT)
 				),
 			},
 		})
@@ -286,15 +283,9 @@ function MP.UI.modlist_to_view(mods, text_colour)
 	return t
 end
 
-G.FUNCS.view_host_hash = function(e)
+G.FUNCS.view_player_hash = function(e)
 	G.FUNCS.overlay_menu({
-		definition = G.UIDEF.create_UIBox_view_hash("host"),
-	})
-end
-
-G.FUNCS.view_guest_hash = function(e)
-	G.FUNCS.overlay_menu({
-		definition = G.UIDEF.create_UIBox_view_hash("guest"),
+		definition = G.UIDEF.create_UIBox_view_hash(e.config.ref_table),
 	})
 end
 
@@ -454,10 +445,12 @@ function G.FUNCS.lobby_leave(e)
 			MP.UI.update_connection_status()
 			MP.MODIFIERS = {}
 			MP._version_mismatch_shown = false
+			MP.LOBBY.players = {}
 			G.STATE = G.STATES.MENU
 		end)
 	else
 		MP.LOBBY.code = nil
+		MP.LOBBY.players = {}
 		MP.ACTIONS.leave_lobby()
 		MP.UI.update_connection_status()
 		MP.MODIFIERS = {}

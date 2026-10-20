@@ -7,7 +7,7 @@ function MP.UI.update_blind_HUD(blind, reset, silent)
         else
             blind_name_string = {
                 {
-                    ref_table = MP.LOBBY.is_host and MP.LOBBY.guest or MP.LOBBY.host,
+                    ref_table = MP.UTILS.get_nemesis(),
                     ref_value = "username",
                 },
             }
@@ -16,7 +16,7 @@ function MP.UI.update_blind_HUD(blind, reset, silent)
         local name_element = G.HUD_blind:get_UIE_by_ID("HUD_blind_name")
         name_element.config.object.config.string =  {
             {
-                ref_table = MP.LOBBY.is_host and MP.LOBBY.guest or MP.LOBBY.host,
+                ref_table = MP.UTILS.get_nemesis(),
                 ref_value = "username",
             },
         }
@@ -37,9 +37,9 @@ function MP.UI.update_blind_HUD(blind, reset, silent)
         -- Setup labels
         -- Casual balala UI experience right here
         G.HUD_blind:get_UIE_by_ID("HUD_blind").children[2].children[2].children[2].children[1].children[1].config.text =
-            localize("k_enemy_score")
+            localize(MP.UTILS.facing_average() and "k_mp_avg_enemy_score" or "k_enemy_score")
         G.HUD_blind:get_UIE_by_ID("HUD_blind").children[2].children[2].children[2].children[3].children[1].config.text =
-            localize("k_enemy_hands")
+            localize(MP.UTILS.facing_average() and "k_mp_avg_enemy_hands" or "k_enemy_hands")
         -- Setup enemy hands
         G.HUD_blind:get_UIE_by_ID("dollars_to_be_earned").parent.parent.states.visible = false
         G.HUD_blind:get_UIE_by_ID("dollars_to_be_earned").config.object.config.string =

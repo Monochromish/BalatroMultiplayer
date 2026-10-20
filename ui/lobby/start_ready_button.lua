@@ -3,10 +3,16 @@ local Disableable_Button = MP.UI.Disableable_Button
 local function get_warnings()
 	local warnings = {}
 
-	-- Check the other player (guest if we're host, host if we're guest)
-	local other_player = MP.LOBBY.is_host and MP.LOBBY.guest or MP.LOBBY.host
+	-- Check the other players
+	local cheating, locked = false, false
+	for _, other_player in ipairs(MP.LOBBY.players) do
+		if not other_player.is_self then
+			cheating = cheating or other_player.cached == false
+			locked = locked or (other_player.config and other_player.config.unlocked == false)
+		end
+	end
 
-	if other_player and other_player.cached == false then
+	if cheating then
 		table.insert(warnings, { localize("k_warning_cheating1"), SMODS.Gradients.warning_text, 0.4 })
 		table.insert(
 			warnings,
@@ -14,7 +20,7 @@ local function get_warnings()
 		)
 	end
 
-	if other_player and other_player.config and other_player.config.unlocked == false then
+	if locked then
 		table.insert(warnings, {
 			localize("k_warning_nemesis_unlock"),
 			SMODS.Gradients.warning_text,
@@ -24,14 +30,19 @@ local function get_warnings()
 
 	local bothPlayersInLobby = MP.LOBBY.guest and MP.LOBBY.guest.config ~= nil
 
+	-- Every guest's version of a mod, or the first one that differs from the host's
+	local function guest_mod_version(mod)
+		local hostVersion = MP.LOBBY.host and MP.LOBBY.host.config and MP.LOBBY.host.config.Mods[mod]
+		for _, player in ipairs(MP.LOBBY.players) do
+			local version = player.config and player.config.Mods[mod]
+			if not player.is_host and version ~= hostVersion then return hostVersion, version end
+		end
+		return hostVersion, hostVersion
+	end
+
 	-- Content mod compatibility warnings (currently Extra Credit only)
 	if bothPlayersInLobby then
-		local hostExtraCreditVersion = MP.LOBBY.host
-			and MP.LOBBY.host.config
-			and MP.LOBBY.host.config.Mods["extracredit"]
-		local guestExtraCreditVersion = MP.LOBBY.guest
-			and MP.LOBBY.guest.config
-			and MP.LOBBY.guest.config.Mods["extracredit"]
+		local hostExtraCreditVersion, guestExtraCreditVersion = guest_mod_version("extracredit")
 
 		if hostExtraCreditVersion ~= guestExtraCreditVersion then
 			table.insert(warnings, {
@@ -48,10 +59,7 @@ local function get_warnings()
 	end
 
 	if MP.LOBBY.ready_to_start or not MP.LOBBY.is_host then
-		local hostSteamoddedVersion = MP.LOBBY.host and MP.LOBBY.host.config and MP.LOBBY.host.config.Mods["Steamodded"]
-		local guestSteamoddedVersion = MP.LOBBY.guest
-			and MP.LOBBY.guest.config
-			and MP.LOBBY.guest.config.Mods["Steamodded"]
+		local hostSteamoddedVersion, guestSteamoddedVersion = guest_mod_version("Steamodded")
 
 		if hostSteamoddedVersion ~= guestSteamoddedVersion then
 			table.insert(warnings, {
@@ -69,16 +77,12 @@ local function get_warnings()
 		})
 	end
 
-	local host_banned_mods = MP.LOBBY.host
-			and MP.LOBBY.host.config
-			and MP.UTILS.get_banned_mods(MP.LOBBY.host.config.Mods)
-		or {}
-	local guest_banned_mods = MP.LOBBY.guest
-			and MP.LOBBY.guest.config
-			and MP.UTILS.get_banned_mods(MP.LOBBY.guest.config.Mods)
-		or {}
+	local any_banned_mods = false
+	for _, player in ipairs(MP.LOBBY.players) do
+		if player.config and #MP.UTILS.get_banned_mods(player.config.Mods) > 0 then any_banned_mods = true end
+	end
 
-	if #host_banned_mods > 0 or #guest_banned_mods > 0 then
+	if any_banned_mods then
 		table.insert(warnings, {
 			localize("k_warning_banned_mods"),
 			G.C.RED,

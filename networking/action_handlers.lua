@@ -49,6 +49,7 @@ function MP.ACTIONS.set_username(username)
 			action = "username",
 			username = MP.LOBBY.username .. "~" .. MP.LOBBY.blind_col,
 			modHash = MP.MOD_STRING,
+			maxPlayers = MP.MAX_PLAYERS,
 		})
 	end
 end
@@ -68,6 +69,7 @@ local function action_connected()
 		action = "username",
 		username = MP.LOBBY.username .. "~" .. MP.LOBBY.blind_col,
 		modHash = MP.MOD_STRING,
+		maxPlayers = MP.MAX_PLAYERS,
 	})
 
 	-- If we have reconnect info, attempt to rejoin the lobby
@@ -178,19 +180,20 @@ local function action_enemyReconnected()
 	MP.UI.UTILS.overlay_message("Opponent reconnected!")
 end
 
+local function parseName(name)
+	local username, col_str = string.match(name, "([^~]+)~(%d+)")
+	username = username or "Guest"
+	local col = tonumber(col_str) or 1
+	col = math.max(1, math.min(col, 25))
+	return username, col
+end
+
 local function action_lobbyInfo(p)
 	local host, hostHash, hostCached = p.host, p.hostHash, p.hostCached
 	local guest, guestHash, guestCached, guestReady = p.guest, p.guestHash, p.guestCached, p.guestReady
 	local is_host = p.isHost
 	MP.LOBBY.players = {}
 	MP.LOBBY.is_host = is_host
-	local function parseName(name)
-		local username, col_str = string.match(name, "([^~]+)~(%d+)")
-		username = username or "Guest"
-		local col = tonumber(col_str) or 1
-		col = math.max(1, math.min(col, 25))
-		return username, col
-	end
 	local hostName, hostCol = parseName(host)
 	local hostConfig, hostMods = MP.UTILS.parse_Hash(hostHash)
 	MP.LOBBY.host = {
@@ -217,9 +220,46 @@ local function action_lobbyInfo(p)
 		MP.LOBBY.guest = {}
 	end
 
-	-- TODO: This should check for player count instead
-	-- once we enable more than 2 players
-	MP.LOBBY.ready_to_start = guest ~= nil and guestReady
+	MP.LOBBY.max_players = tonumber(p.maxPlayers)
+	MP.LOBBY.self_id = tonumber(p.selfId)
+	if type(p.players) == "table" then
+		local all_ready = #p.players >= 2
+		local self_ready = false
+		for _, entry in ipairs(p.players) do
+			local name, col = parseName(entry.username or "")
+			local config, mods = MP.UTILS.parse_Hash(entry.modHash or "")
+			local player = {
+				id = tonumber(entry.id),
+				username = name,
+				blind_col = col,
+				hash_str = mods,
+				hash = hash(mods),
+				cached = entry.cached,
+				config = config,
+				ready = entry.ready,
+				is_host = entry.isHost,
+				connected = entry.connected,
+			}
+			player.is_self = player.id == MP.LOBBY.self_id
+			if player.is_self then self_ready = player.ready end
+			if not player.is_host and not player.ready then all_ready = false end
+			table.insert(MP.LOBBY.players, player)
+		end
+		MP.LOBBY.ready_to_start = is_host and all_ready or (not is_host and self_ready)
+		-- A guest promoted to host re-sends its config, so keep it at what this lobby allows
+		if not is_host and MP.LOBBY.max_players then MP.LOBBY.config.max_players = MP.LOBBY.max_players end
+	else
+		-- Servers without bigger lobbies only describe the host and guest
+		MP.LOBBY.host.is_host = true
+		MP.LOBBY.host.is_self = is_host
+		table.insert(MP.LOBBY.players, MP.LOBBY.host)
+		if guest ~= nil then
+			MP.LOBBY.guest.is_self = not is_host
+			MP.LOBBY.guest.ready = guestReady
+			table.insert(MP.LOBBY.players, MP.LOBBY.guest)
+		end
+		MP.LOBBY.ready_to_start = guest ~= nil and guestReady
+	end
 
 	if MP.LOBBY.is_host then MP.ACTIONS.lobby_options() end
 
@@ -283,6 +323,9 @@ local function action_start_game(p)
 	MP.GHOST.clear()
 
 	MP.reset_game_states()
+	-- With more than two players the opponent is the average of the others
+	MP.GAME.multi = (tonumber(p.playerCount) or 2) > 2
+	MP.GAME.players = {}
 	local stake = tonumber(p.stake)
 	MP.ACTIONS.set_ante(0)
 	if not MP.LOBBY.config.different_seeds and MP.LOBBY.config.custom_seed ~= "random" then
@@ -366,7 +409,8 @@ local function action_enemy_info(p)
 	-- No-animation timer: If opponent skip, add time immediately
 	if skips and MP.GAME.enemy.skips ~= skips then
 		for i = 1, skips - MP.GAME.enemy.skips do
-			MP.GAME.enemy.spent_in_shop[#MP.GAME.enemy.spent_in_shop + 1] = 0
+			-- In bigger games the server's averaged spentLastShop already has the skips
+			if not MP.GAME.multi then MP.GAME.enemy.spent_in_shop[#MP.GAME.enemy.spent_in_shop + 1] = 0 end
             MP.GAME.enemy.skips_before_pvp = (MP.GAME.enemy.skips_before_pvp or 0) + 1
             MP.UI.update_matching_skip_timer(true)
 
@@ -472,6 +516,64 @@ local function action_enemy_info(p)
 	MP.GAME.enemy.skips = skips or 0
 	MP.GAME.enemy.lives = lives or 0
 	if MP.UI.juice_up_pvp_hud then MP.UI.juice_up_pvp_hud() end
+end
+
+local function show_player_notice(text)
+	sendDebugMessage(text, "MULTIPLAYER")
+	if not G.play then return end
+	attention_text({
+		scale = 0.6,
+		text = text,
+		hold = 4,
+		align = "cm",
+		offset = { x = 0, y = -2.7 },
+		major = G.play,
+	})
+end
+
+-- Everyone's state in a game of more than two players
+local function action_players_info(p)
+	if type(p.players) ~= "table" then return end
+	MP.GAME.players = MP.GAME.players or {}
+	for _, entry in ipairs(p.players) do
+		local id = tonumber(entry.id)
+		local player = MP.GAME.players[id]
+		if not player then
+			player = { id = id, highest_score = MP.INSANE_INT.empty() }
+			MP.GAME.players[id] = player
+		end
+		player.username, player.blind_col = parseName(entry.username or "")
+		if player.alive and not entry.alive and id ~= MP.LOBBY.self_id then
+			play_sound("holo1", 0.865, 0.9)
+			show_player_notice(localize({ type = "variable", key = "k_mp_player_out", vars = { player.username } }))
+		end
+		player.alive = entry.alive
+		player.place = tonumber(entry.place) or 0
+		player.lives = tonumber(entry.lives) or 0
+		player.hands = tonumber(entry.handsLeft) or 0
+		player.skips = tonumber(entry.skips) or 0
+		player.location = entry.location
+		player.ready = entry.ready
+		player.connected = entry.connected
+		if entry.score then
+			player.score = MP.INSANE_INT.from_string(tostring(entry.score))
+			if MP.INSANE_INT.greater_than(player.score, player.highest_score) then player.highest_score = player.score end
+		end
+	end
+	MP.UTILS.update_nemesis_group()
+end
+
+-- A player dropped from a game that carries on without waiting for them
+local function action_player_disconnected(p)
+	show_player_notice(
+		localize({ type = "variable", key = "k_mp_player_disconnected", vars = { MP.UTILS.player_name(p.id) } })
+	)
+end
+
+local function action_player_reconnected(p)
+	show_player_notice(
+		localize({ type = "variable", key = "k_mp_player_reconnected", vars = { MP.UTILS.player_name(p.id) } })
+	)
 end
 
 local function action_stop_game()
@@ -617,6 +719,7 @@ local function action_lobby_options(options)
 			or k == "showdown_starting_antes"
 			or k == "pvp_countdown_seconds"
 			or k == "timer_forgiveness"
+			or k == "max_players"
 		then
 			parsed_v = tonumber(v)
 		end
@@ -1490,7 +1593,10 @@ local HANDLERS = {
 	rejoinedLobby = action_rejoinedLobby,
 	enemyDisconnected = action_enemyDisconnected,
 	enemyReconnected = action_enemyReconnected,
+	playerDisconnected = action_player_disconnected,
+	playerReconnected = action_player_reconnected,
 	lobbyInfo = action_lobbyInfo,
+	playersInfo = action_players_info,
 	startGame = action_start_game,
 	startBlind = action_start_blind,
 	enemyInfo = action_enemy_info,

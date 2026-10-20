@@ -119,10 +119,17 @@ function MP.UI.create_UIBox_settings() -- optimize this please
 end
 
 function MP.UI.create_UIBox_players()
-	local players = {
-		MP.UI.create_UIBox_player_row("host"),
-		MP.UI.create_UIBox_player_row("guest"),
-	}
+	local players = {}
+	if MP.GAME.multi then
+		for _, player in ipairs(MP.LOBBY.players) do
+			table.insert(players, MP.UI.create_UIBox_player_row(player))
+		end
+	else
+		players = {
+			MP.UI.create_UIBox_player_row("host"),
+			MP.UI.create_UIBox_player_row("guest"),
+		}
+	end
 
 	local t = {
 		n = G.UIT.ROOT,
@@ -144,7 +151,9 @@ function MP.UI.create_UIBox_mods_list(type)
 				n = G.UIT.C,
 				config = { align = "cm" },
 				nodes = MP.UI.modlist_to_view(
-					type == "host" and MP.LOBBY.host.config.Mods or MP.LOBBY.guest.config.Mods,
+					type == "host" and MP.LOBBY.host.config.Mods
+						or type == "guest" and MP.LOBBY.guest.config.Mods
+						or type.config and type.config.Mods,
 					G.C.UI.TEXT_DARK
 				),
 			},
@@ -152,12 +161,22 @@ function MP.UI.create_UIBox_mods_list(type)
 	}
 end
 
+-- `type` is "host"/"guest" in 1v1, or a lobby player in a bigger game
 function MP.UI.create_UIBox_player_row(type)
 	local player_name = type == "host" and MP.LOBBY.host.username or MP.LOBBY.guest.username
 	local lives = MP.GAME.enemy.lives
 	local highest_score = MP.GAME.enemy.highest_score
 	local skips = MP.GAME.enemy.skips or 0
-	if (type == "host" and MP.LOBBY.is_host) or (type == "guest" and not MP.LOBBY.is_host) then
+	local is_self = (type == "host" and MP.LOBBY.is_host) or (type == "guest" and not MP.LOBBY.is_host)
+	if type ~= "host" and type ~= "guest" then
+		local state = MP.GAME.players[type.id] or {}
+		player_name = type.username
+		lives = state.lives or 0
+		highest_score = state.highest_score or MP.INSANE_INT.empty()
+		skips = state.skips or 0
+		is_self = type.is_self
+	end
+	if is_self then
 		lives = MP.GAME.lives
 		highest_score = MP.GAME.highest_score
 		skips = G.GAME.skips or 0

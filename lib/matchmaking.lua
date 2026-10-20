@@ -200,14 +200,16 @@ function MP.UTILS.player_mod_version(player, mod_name)
 end
 
 function MP.UTILS.mp_version_mismatch()
-	local other = MP.LOBBY.is_host and MP.LOBBY.guest or MP.LOBBY.host
-	local their_version = other and MP.UTILS.player_mod_version(other, "Multiplayer")
-	if not their_version then return false end
-	local our_version = SMODS.Mods["Multiplayer"].version
-	local our_prefix = MP.UTILS.version_prefix(our_version)
-	local their_prefix = MP.UTILS.version_prefix(their_version)
-	if our_prefix and their_prefix and our_prefix ~= their_prefix then
-		return true, our_version, their_version
+	for _, other in ipairs(MP.LOBBY.players) do
+		local their_version = not other.is_self and MP.UTILS.player_mod_version(other, "Multiplayer")
+		if their_version then
+			local our_version = SMODS.Mods["Multiplayer"].version
+			local our_prefix = MP.UTILS.version_prefix(our_version)
+			local their_prefix = MP.UTILS.version_prefix(their_version)
+			if our_prefix and their_prefix and our_prefix ~= their_prefix then
+				return true, our_version, their_version
+			end
+		end
 	end
 	return false
 end
@@ -219,12 +221,7 @@ local VERSION_CHECKS = {
 	{ name = "Steamodded", prefix = false },
 }
 
--- Returns { mod, our, their } for each checked mod whose version differs from the opponent's.
-function MP.UTILS.version_mismatches()
-	local other = MP.LOBBY.is_host and MP.LOBBY.guest or MP.LOBBY.host
-	if not other then return {} end
-
-	local results = {}
+local function add_version_mismatches(other, results)
 	for _, check in ipairs(VERSION_CHECKS) do
 		local their_version = MP.UTILS.player_mod_version(other, check.name)
 		local our_version = SMODS.Mods[check.name] and SMODS.Mods[check.name].version
@@ -237,10 +234,22 @@ function MP.UTILS.version_mismatches()
 			else
 				mismatch = our_version ~= their_version
 			end
-			if mismatch then
+			local seen = false
+			for _, result in ipairs(results) do
+				seen = seen or (result.mod == check.name and result.their == their_version)
+			end
+			if mismatch and not seen then
 				table.insert(results, { mod = check.name, our = our_version, their = their_version })
 			end
 		end
+	end
+end
+
+-- Returns { mod, our, their } for each checked mod whose version differs from another player's.
+function MP.UTILS.version_mismatches()
+	local results = {}
+	for _, other in ipairs(MP.LOBBY.players) do
+		if not other.is_self then add_version_mismatches(other, results) end
 	end
 	return results
 end

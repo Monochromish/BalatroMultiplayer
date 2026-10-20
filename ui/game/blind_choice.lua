@@ -139,7 +139,7 @@ function create_UIBox_blind_choice(type, run_info)
 			if MP.GHOST.is_active() then
 				loc_name = MP.GHOST.get_nemesis_name()
 			else
-				loc_name = MP.LOBBY.is_host and MP.LOBBY.guest.username or MP.LOBBY.host.username
+				loc_name = MP.UTILS.get_nemesis_name()
 			end
 		else
 			loc_name = localize({ type = "name_text", key = blind_choice.config.key, set = "Blind" })
@@ -160,7 +160,11 @@ function create_UIBox_blind_choice(type, run_info)
 
 		local text_table = loc_target
 
-		if G.GAME.round_resets.pvp_blind_choices[type] then text_table[#text_table + 1] = localize("k_bl_mostchips") end
+		if MP.UTILS.facing_average() and (nemesis or G.GAME.round_resets.pvp_blind_choices[type]) then
+			text_table[#text_table + 1] = localize("k_mp_bl_beat_average")
+		elseif G.GAME.round_resets.pvp_blind_choices[type] then
+			text_table[#text_table + 1] = localize("k_bl_mostchips")
+		end
 
 		local blind_state = G.GAME.round_resets.blind_states[type]
 		local _reward = true

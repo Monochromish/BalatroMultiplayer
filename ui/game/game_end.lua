@@ -7,10 +7,10 @@ function MP.UI.create_UIBox_round_scores_row_nemesis()
     if MP.GHOST.is_active() then
         blind_name_string = MP.GHOST.get_blind_name_ui() or "ERROR"
     else
-        blind_name_string = (MP.LOBBY.is_host and MP.LOBBY.guest or MP.LOBBY.host or {})["username"] or "ERROR"
+        blind_name_string = (MP.UTILS.get_end_game_nemesis() or {})["username"] or "ERROR"
     end
 
-    local nemesis_blind_col = MP.UTILS.get_nemesis_key()
+    local nemesis_blind_col = MP.UTILS.get_nemesis_key(false, MP.GAME.multi and MP.UTILS.get_end_game_nemesis() or nil)
     local blind_choice = {}
     blind_choice.animation = AnimatedSprite(0,0, 0.5, 0.5, G.ANIMATION_ATLAS["mp_player_blind_col"], G.P_BLINDS[nemesis_blind_col].pos)
     blind_choice.animation:define_draw_steps({

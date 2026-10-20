@@ -30,7 +30,14 @@ MP.LOBBY = {
 	guest = {},
 	is_host = false,
 	ready_to_start = false,
+	-- Everyone in the lobby in join order (host first), filled from lobbyInfo
+	players = {},
+	self_id = nil,
+	-- Lobby size the server allows; nil on servers without bigger lobbies
+	max_players = nil,
 }
+-- Most players a lobby can show; sent to the server with the username
+MP.MAX_PLAYERS = 8
 MP.GAME = {}
 MP.UI = {}
 MP.ACTIONS = {}
@@ -199,6 +206,7 @@ function MP.reset_lobby_config(persist_ruleset_and_gamemode)
 		legacy_smallworld = false,
 		-- Baseline off; start_lobby sets it on for standard-layer rulesets.
 		hide_score_until_played = false,
+		max_players = 2,
 		enemy_location_disabled = false,
 		timer_display_threshold = 0,
 	}

@@ -45,6 +45,11 @@ G.FUNCS.change_starting_lives = function(args)
 	send_lobby_options()
 end
 
+G.FUNCS.change_max_players = function(args)
+	MP.LOBBY.config.max_players = args.to_val
+	send_lobby_options()
+end
+
 -- This needs to have a parameter because its a callback for inputs
 local function send_lobby_options(value)
 	MP.ACTIONS.lobby_options()
@@ -73,6 +78,15 @@ function MP.UI.create_lobby_options_tab()
 				MP.LOBBY.config.starting_lives,
 				"change_starting_lives"
 			),
+			-- Only servers that send maxPlayers can hold more than two
+			MP.LOBBY.max_players and create_lobby_option_cycle(
+				"max_players_option",
+				"b_opts_max_players",
+				0.85,
+				{ 2, 3, 4, 5, 6, 7, 8 },
+				(MP.LOBBY.config.max_players or 2) - 1,
+				"change_max_players"
+			) or nil,
 			create_lobby_option_toggle("multiplayer_jokers_toggle", "b_opts_multiplayer_jokers", "multiplayer_jokers"),
 			create_lobby_option_toggle("different_decks_toggle", "b_opts_player_diff_deck", "different_decks", function()
 				send_lobby_options()
